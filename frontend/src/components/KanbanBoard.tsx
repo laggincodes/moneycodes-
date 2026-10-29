@@ -35,7 +35,7 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
   onUpdatePipeline,
 }) => {
   return (
-    <div className="overflow-x-auto pb-4">
+    <div className="overflow-x-auto -webkit-overflow-scrolling-touch pb-4">
       <div className="flex gap-4 min-w-[1280px]">
         {COLUMNS.map((col) => {
           const colLeads = leads.filter((l) => l.pipeline_status === col.id);

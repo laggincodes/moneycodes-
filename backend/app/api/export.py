@@ -1,25 +1,33 @@
 """
 CSV Export API Endpoint.
 Exports discovered and audited leads into a clean, comprehensive CSV file.
+Enforces authentication and strict account isolation.
 """
 import csv
 import io
 import json
 from datetime import datetime, timezone
 from typing import Optional
-from fastapi import APIRouter, Query, Response
+from fastapi import APIRouter, Query, Response, Depends
 from app.database import get_db
+from app.auth.dependencies import get_current_user
 
 router = APIRouter(prefix="/api/export", tags=["Export"])
 
 
 @router.get("/csv")
-async def export_leads_csv(pipeline_status: Optional[str] = None):
-    where_sql = ""
-    params = []
+async def export_leads_csv(
+    pipeline_status: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    where_clauses = ["user_id = ?"]
+    params = [user["id"]]
+
     if pipeline_status:
-        where_sql = "WHERE pipeline_status = ?"
+        where_clauses.append("pipeline_status = ?")
         params.append(pipeline_status.strip().lower())
+
+    where_sql = f"WHERE {' AND '.join(where_clauses)}"
 
     with get_db() as conn:
         rows = conn.execute(

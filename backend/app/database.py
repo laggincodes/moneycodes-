@@ -5,6 +5,7 @@ import os
 import sqlite3
 from typing import Generator
 from contextlib import contextmanager
+from app.migrations import run_migrations
 
 DATABASE_PATH = os.getenv("DATABASE_PATH", "websitelead_hunter.db")
 
@@ -89,3 +90,4 @@ def init_db(db_path: str = None):
         CREATE INDEX IF NOT EXISTS idx_leads_job_id ON leads (job_id);
         CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs (status);
         """)
+        run_migrations(conn)

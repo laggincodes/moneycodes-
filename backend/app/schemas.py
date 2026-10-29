@@ -39,6 +39,9 @@ class JobResponse(BaseModel):
     logs: List[JobLogEntry] = []
     created_at: str
     updated_at: str
+    worker_id: Optional[str] = None
+    lease_version: Optional[int] = None
+    retry_count: Optional[int] = None
 
 
 class AuditFinding(BaseModel):

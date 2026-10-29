@@ -24,7 +24,12 @@ wheels/
 .coverage
 htmlcov/
 *.db
+*.db-shm
+*.db-wal
+*.db.backup*
 *.sqlite3
+*.wlhbak
+.admin_token
 
 # Node / Frontend
 node_modules/

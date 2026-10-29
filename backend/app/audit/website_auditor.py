@@ -1,18 +1,75 @@
 """
-Website Auditor: Performs HTTP reachability, SSL validation, redirect chain inspection,
+Website Auditor: Performs hardened HTTP reachability, SSL validation, redirect inspection,
 and HTML heuristic analysis for mobile responsiveness, metadata, CTAs, and contact channels.
+Includes strict Server-Side Request Forgery (SSRF) and DNS rebinding protections.
 """
-import re
-import time
+import asyncio
+import ipaddress
 import logging
-from typing import Optional, List, Dict, Any, Tuple
-from urllib.parse import urlparse
-import httpx
-from bs4 import BeautifulSoup
+import re
+import socket
+import ssl
+import time
+from typing import Dict, List, Optional, Set, Tuple, Union
+import urllib.parse
 
-from app.schemas import WebsiteAuditResult, AuditFinding
+from bs4 import BeautifulSoup
+import httpcore
+import httpx
+
+from app.schemas import AuditFinding, WebsiteAuditResult
 
 logger = logging.getLogger(__name__)
+
+# --- SSRF Protection Constants ---
+
+ALLOWED_SCHEMES: Set[str] = {"http", "https"}
+ALLOWED_PORTS: Set[int] = {80, 443, 8080, 8443}
+MAX_REDIRECTS: int = 5
+MAX_RESPONSE_BYTES: int = 512 * 1024  # 512 KB maximum response buffering
+DEFAULT_CONNECT_TIMEOUT: float = 4.0
+DEFAULT_READ_TIMEOUT: float = 6.0
+DEFAULT_TOTAL_TIMEOUT: float = 10.0
+
+# Comprehensive prohibited IP networks (IPv4 & IPv6)
+PROHIBITED_NETWORKS = [
+    ipaddress.ip_network("127.0.0.0/8"),      # IPv4 loopback
+    ipaddress.ip_network("10.0.0.0/8"),       # RFC1918 private
+    ipaddress.ip_network("172.16.0.0/12"),    # RFC1918 private
+    ipaddress.ip_network("192.168.0.0/16"),   # RFC1918 private
+    ipaddress.ip_network("169.254.0.0/16"),   # Link-local / AWS/GCP/Azure Cloud Metadata
+    ipaddress.ip_network("100.64.0.0/10"),    # Carrier-grade NAT
+    ipaddress.ip_network("0.0.0.0/8"),        # Current network
+    ipaddress.ip_network("240.0.0.0/4"),      # Reserved
+    ipaddress.ip_network("224.0.0.0/4"),      # Multicast
+    ipaddress.ip_network("192.0.2.0/24"),     # TEST-NET-1 documentation
+    ipaddress.ip_network("198.51.100.0/24"),  # TEST-NET-2 documentation
+    ipaddress.ip_network("203.0.113.0/24"),   # TEST-NET-3 documentation
+    ipaddress.ip_network("::1/128"),          # IPv6 loopback
+    ipaddress.ip_network("fc00::/7"),         # IPv6 unique local (private)
+    ipaddress.ip_network("fe80::/10"),        # IPv6 link-local
+    ipaddress.ip_network("ff00::/8"),         # IPv6 multicast
+    ipaddress.ip_network("::/128"),           # IPv6 unspecified
+    ipaddress.ip_network("2001:db8::/32"),    # IPv6 documentation
+]
+
+# Blacklisted hostnames and metadata endpoints
+BLOCKED_HOSTNAMES: Set[str] = {
+    "localhost",
+    "metadata.google.internal",
+    "instance-data",
+    "metadata.packet.net",
+}
+
+BLOCKED_HOSTNAME_SUFFIXES: Tuple[str, ...] = (
+    ".localhost",
+    ".local",
+    ".internal",
+    ".corp",
+    ".lan",
+    ".home",
+    ".onion",
+)
 
 PHONE_REGEX = re.compile(r"(\+?\d{1,3}[-.\s]?)?\(?\d{2,5}\)?[-.\s]?\d{3,5}[-.\s]?\d{3,5}")
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
@@ -24,15 +81,260 @@ FOOD_MENU_KEYWORDS = ["menu", "food menu", "beverages", "drinks", "order online"
 SERVICE_KEYWORDS = ["services", "treatments", "pricing", "packages", "consultation", "specialists"]
 
 
+class SSRFBlockedError(Exception):
+    """Raised when a request is blocked by SSRF prevention policies."""
+    pass
+
+
+def is_ip_prohibited(ip_obj: Union[ipaddress.IPv4Address, ipaddress.IPv6Address]) -> Tuple[bool, str]:
+    """
+    Checks if an IP address belongs to loopback, private, link-local,
+    cloud metadata, multicast, unspecified, or reserved networks.
+    Unwraps IPv4-mapped IPv6 addresses (e.g. ::ffff:127.0.0.1).
+    """
+    # Unwrap IPv4-mapped IPv6 addresses (e.g. ::ffff:127.0.0.1 -> 127.0.0.1)
+    if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped:
+        ip_obj = ip_obj.ipv4_mapped
+
+    if ip_obj.is_loopback:
+        return True, f"Loopback address ({ip_obj}) is prohibited"
+    if ip_obj.is_link_local:
+        return True, f"Link-local / cloud metadata address ({ip_obj}) is prohibited"
+    if ip_obj.is_unspecified:
+        return True, f"Unspecified address ({ip_obj}) is prohibited"
+    if ip_obj.is_multicast:
+        return True, f"Multicast address ({ip_obj}) is prohibited"
+    if ip_obj.is_private:
+        return True, f"Private network address ({ip_obj}) is prohibited"
+    if ip_obj.is_reserved:
+        return True, f"Reserved network address ({ip_obj}) is prohibited"
+
+    for net in PROHIBITED_NETWORKS:
+        if ip_obj in net:
+            return True, f"Address ({ip_obj}) belongs to restricted subnet {net}"
+
+    return False, ""
+
+
+def parse_raw_ip(host_str: str) -> Optional[Union[ipaddress.IPv4Address, ipaddress.IPv6Address]]:
+    """Attempts to parse standard, decimal integer, hex, or BSD shorthand IP representations."""
+    clean = host_str.strip()
+    try:
+        return ipaddress.ip_address(clean)
+    except ValueError:
+        pass
+
+    # Check integer decimal literal (e.g. 2130706433)
+    if clean.isdigit():
+        try:
+            return ipaddress.ip_address(int(clean))
+        except ValueError:
+            pass
+
+    # Check hex literal (e.g. 0x7f000001)
+    if clean.startswith(("0x", "0X")):
+        try:
+            return ipaddress.ip_address(int(clean, 16))
+        except ValueError:
+            pass
+
+    # Check shorthand BSD dot-notation (e.g. 127.1)
+    if "." in clean and all(part.isdigit() for part in clean.split(".")):
+        try:
+            raw_bytes = socket.inet_aton(clean)
+            return ipaddress.ip_address(raw_bytes)
+        except Exception:
+            pass
+
+    return None
+
+
+def validate_url(url: str) -> urllib.parse.SplitResult:
+    """
+    Validates a URL before any network connection:
+    - Scheme must be strictly http or https
+    - Rejects embedded credentials (user:pass@)
+    - Rejects prohibited ports (only standard web ports allowed)
+    - Rejects localhost aliases, metadata names, and integer/hex IP literals
+    """
+    if not url or not isinstance(url, str):
+        raise SSRFBlockedError("URL must be a non-empty string.")
+
+    cleaned_url = url.strip()
+    try:
+        parsed = urllib.parse.urlsplit(cleaned_url)
+    except Exception as exc:
+        raise SSRFBlockedError(f"Malformed URL: {exc}")
+
+    # 1. Scheme Check
+    scheme = parsed.scheme.lower()
+    if scheme not in ALLOWED_SCHEMES:
+        raise SSRFBlockedError(f"Scheme '{scheme}' is prohibited. Only HTTP and HTTPS are permitted.")
+
+    # 2. Embedded Credentials Check
+    if parsed.username or parsed.password or ("@" in parsed.netloc):
+        raise SSRFBlockedError("URLs with embedded credentials (user:pass@) are prohibited.")
+
+    # 3. Hostname Check
+    host = parsed.hostname
+    if not host or not host.strip():
+        raise SSRFBlockedError("URL has an empty hostname.")
+
+    clean_host = host.strip().lower()
+
+    # Reject null bytes or whitespace
+    if any(c in clean_host for c in ["\x00", " ", "\t", "\r", "\n"]):
+        raise SSRFBlockedError("Hostname contains invalid control characters or whitespace.")
+
+    # Check blocked hostnames and suffixes
+    if clean_host in BLOCKED_HOSTNAMES:
+        raise SSRFBlockedError(f"Target host '{clean_host}' is prohibited by security policy.")
+
+    for suffix in BLOCKED_HOSTNAME_SUFFIXES:
+        if clean_host.endswith(suffix):
+            raise SSRFBlockedError(f"Target host '{clean_host}' belongs to prohibited local domain.")
+
+    # 4. Check for direct, decimal integer, hex, or shorthand IP targets
+    raw_ip = parse_raw_ip(clean_host)
+    if raw_ip is not None:
+        is_bad, reason = is_ip_prohibited(raw_ip)
+        if is_bad:
+            raise SSRFBlockedError(f"IP target is prohibited: {reason}")
+
+    # 5. Port Check
+    port = parsed.port
+    if port is not None and port not in ALLOWED_PORTS:
+        raise SSRFBlockedError(f"Target port {port} is prohibited. Allowed web ports: {sorted(ALLOWED_PORTS)}")
+
+    return parsed
+
+
+class SSRFSafeNetworkBackend(httpcore.AsyncNetworkBackend):
+    """
+    Custom httpcore network backend that intercepts connect_tcp calls:
+    - Resolves DNS asynchronously
+    - Validates ALL resolved IP addresses (prevents mixed answers)
+    - Directly connects the underlying TCP socket to the validated IP (prevents DNS rebinding / TOCTOU)
+    - Preserves original hostname for SNI and TLS certificate verification
+    """
+
+    def __init__(self):
+        self._inner = httpcore._backends.auto.AutoBackend()
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: Optional[float] = None,
+        local_address: Optional[str] = None,
+        socket_options=None,
+    ) -> httpcore.AsyncNetworkStream:
+        clean_host = host.strip().strip("[]")
+
+        # Resolve DNS addresses
+        loop = asyncio.get_running_loop()
+        try:
+            addr_info = await loop.getaddrinfo(
+                clean_host,
+                port,
+                family=socket.AF_UNSPEC,
+                type=socket.SOCK_STREAM,
+                proto=socket.IPPROTO_TCP,
+            )
+        except socket.gaierror as exc:
+            raise httpcore.ConnectError(f"DNS resolution failed for '{clean_host}': {exc}") from exc
+
+        if not addr_info:
+            raise httpcore.ConnectError(f"No DNS records found for host '{clean_host}'")
+
+        validated_ips: List[str] = []
+        # Crucial security rule: validate ALL returned IP addresses.
+        # If ANY returned address is prohibited, reject the entire host!
+        for entry in addr_info:
+            sockaddr = entry[4]
+            ip_str = sockaddr[0]
+            try:
+                ip_obj = ipaddress.ip_address(ip_str)
+            except ValueError:
+                raise SSRFBlockedError(f"Unparseable IP address '{ip_str}' returned by DNS for '{clean_host}'")
+
+            is_bad, reason = is_ip_prohibited(ip_obj)
+            if is_bad:
+                raise SSRFBlockedError(
+                    f"Host '{clean_host}' resolved to restricted destination '{ip_str}': {reason}"
+                )
+            if ip_str not in validated_ips:
+                validated_ips.append(ip_str)
+
+        if not validated_ips:
+            raise SSRFBlockedError(f"No valid public IP addresses available for host '{clean_host}'")
+
+        # Pick the first validated IP address to pin the connection directly
+        target_ip = validated_ips[0]
+
+        # Connect directly to the validated IP address
+        # Note: httpcore passes server_hostname to stream.start_tls() separately,
+        # preserving the original host for SNI and TLS certificate verification!
+        return await self._inner.connect_tcp(
+            target_ip,
+            port,
+            timeout=timeout,
+            local_address=local_address,
+            socket_options=socket_options,
+        )
+
+    async def connect_unix_socket(self, path: str, timeout: Optional[float] = None, socket_options=None):
+        raise SSRFBlockedError("Unix domain socket connections are prohibited.")
+
+    async def sleep(self, seconds: float) -> None:
+        await asyncio.sleep(seconds)
+
+
+def create_ssrf_safe_client(timeout: float = DEFAULT_TOTAL_TIMEOUT) -> httpx.AsyncClient:
+    """
+    Constructs an httpx.AsyncClient equipped with SSRFSafeNetworkBackend,
+    enforcing TLS certificate verification and safe timeouts.
+    """
+    safe_backend = SSRFSafeNetworkBackend()
+    pool = httpcore.AsyncConnectionPool(
+        network_backend=safe_backend,
+        ssl_context=None,  # Standard system SSL context with verification
+        max_connections=15,
+        max_keepalive_connections=5,
+        keepalive_expiry=5.0,
+        retries=0,
+    )
+    transport = httpx.AsyncHTTPTransport(
+        verify=True,  # STRICT TLS certificate verification enabled
+        trust_env=False,  # Prevent ambient proxy environment variables from bypassing validation
+    )
+    transport._pool = pool
+
+    timeouts = httpx.Timeout(
+        timeout=timeout,
+        connect=DEFAULT_CONNECT_TIMEOUT,
+        read=DEFAULT_READ_TIMEOUT,
+        write=DEFAULT_CONNECT_TIMEOUT,
+        pool=DEFAULT_CONNECT_TIMEOUT,
+    )
+
+    return httpx.AsyncClient(
+        transport=transport,
+        timeout=timeouts,
+        follow_redirects=False,  # Manual redirect validation
+        headers={"Accept-Encoding": "gzip, deflate"},
+    )
+
+
 class WebsiteAuditor:
     """
-    Performs deterministic, non-invasive website audits.
-    Distinguishes verified HTTP/HTML findings from inferred business opportunities.
+    Performs deterministic, non-invasive website audits with strict SSRF defense.
+    Distinguishes verified findings from inferred opportunities.
     """
 
     def __init__(
         self,
-        timeout: float = 10.0,
+        timeout: float = DEFAULT_TOTAL_TIMEOUT,
         user_agent: str = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 WebsiteAuditor/1.0"
@@ -49,6 +351,7 @@ class WebsiteAuditor:
     ) -> WebsiteAuditResult:
         """
         Audits a website if URL is provided, or generates a no-website assessment.
+        All requests are executed within the SSRF-hardened boundary.
         """
         # Case 1: No website URL listed
         if not url or not url.strip():
@@ -96,8 +399,15 @@ class WebsiteAuditor:
         if not (clean_url.startswith("http://") or clean_url.startswith("https://")):
             clean_url = f"https://{clean_url}"
 
-        # Case 2: Website URL provided - perform live check
+        # Pre-validate starting URL
+        try:
+            validate_url(clean_url)
+        except SSRFBlockedError as exc:
+            logger.warning(f"Initial audit URL blocked by SSRF policy: {exc}")
+            return self._build_blocked_result(clean_url, str(exc))
+
         redirect_chain: List[str] = [clean_url]
+        current_url = clean_url
         headers = {
             "User-Agent": self.user_agent,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -105,48 +415,187 @@ class WebsiteAuditor:
         }
 
         start_time = time.monotonic()
+        hop_count = 0
+        response_data: Optional[httpx.Response] = None
+        html_text = ""
+        ssl_error_detected = False
+
         try:
-            async with httpx.AsyncClient(
-                timeout=self.timeout,
-                follow_redirects=True,
-                verify=False,  # Don't crash on bad SSL; detect and flag it cleanly
-            ) as client:
-                response = await client.get(clean_url, headers=headers)
-                response_time_ms = int((time.monotonic() - start_time) * 1000)
+            async with create_ssrf_safe_client(timeout=self.timeout) as client:
+                while hop_count < MAX_REDIRECTS:
+                    try:
+                        # Stream response to cap maximum buffered size
+                        async with client.stream("GET", current_url, headers=headers) as response:
+                            response_data = response
+                            status_code = response.status_code
 
-                for r in response.history:
-                    redirect_chain.append(str(r.url))
-                final_url = str(response.url)
-                if final_url != redirect_chain[-1]:
-                    redirect_chain.append(final_url)
+                            # Check for redirects (3xx)
+                            if 300 <= status_code < 400:
+                                hop_count += 1
+                                location = response.headers.get("Location")
+                                if not location:
+                                    break
 
-                status_code = response.status_code
-                is_reachable = (200 <= status_code < 400)
-                ssl_valid = final_url.startswith("https://")
+                                next_url = urllib.parse.urljoin(current_url, location)
 
-                # Parse HTML content if text/html
-                html_text = response.text or ""
-                return self._analyze_html(
-                    raw_html=html_text,
-                    url=clean_url,
-                    final_url=final_url,
-                    status_code=status_code,
-                    is_reachable=is_reachable,
-                    ssl_valid=ssl_valid,
-                    redirect_chain=redirect_chain,
-                    response_time_ms=response_time_ms,
-                    business_name=business_name,
-                    category=category,
-                )
+                                # Check redirect loops
+                                if next_url in redirect_chain:
+                                    raise SSRFBlockedError(f"Redirect loop detected targeting {next_url}")
 
-        except httpx.ConnectTimeout:
-            return self._build_unreachable_result(clean_url, "Connection Timeout", "Site failed to respond within 10s.")
+                                # Re-validate destination URL
+                                validate_url(next_url)
+
+                                redirect_chain.append(next_url)
+                                current_url = next_url
+                                continue
+
+                            # Reached final non-redirect response
+                            # Verify content-type is acceptable (HTML or text)
+                            content_type = response.headers.get("Content-Type", "").lower()
+                            if content_type and not any(ct in content_type for ct in ["text/html", "application/xhtml", "text/plain", "application/xml"]):
+                                # Non-HTML response (binary, PDF, etc.) - do not parse
+                                html_text = ""
+                                break
+
+                            # Read response body with maximum byte cap
+                            chunks = []
+                            total_bytes = 0
+                            async for chunk in response.aiter_bytes(chunk_size=8192):
+                                total_bytes += len(chunk)
+                                chunks.append(chunk)
+                                if total_bytes >= MAX_RESPONSE_BYTES:
+                                    logger.info(f"Response size reached limit ({MAX_RESPONSE_BYTES} bytes); truncating safely.")
+                                    break
+
+                            raw_bytes = b"".join(chunks)
+                            encoding = response.encoding or "utf-8"
+                            html_text = raw_bytes.decode(encoding, errors="replace")
+                            break
+
+                    except (ssl.SSLCertVerificationError, httpx.ConnectError) as exc:
+                        err_str = str(exc)
+                        if "certificate" in err_str.lower() or "ssl" in err_str.lower():
+                            ssl_error_detected = True
+                            return self._build_ssl_failure_result(current_url, err_str)
+                        raise
+
+                if hop_count >= MAX_REDIRECTS and response_data and (300 <= response_data.status_code < 400):
+                    raise SSRFBlockedError(f"Exceeded maximum redirect limit ({MAX_REDIRECTS} hops).")
+
+            response_time_ms = int((time.monotonic() - start_time) * 1000)
+            final_url = redirect_chain[-1]
+            final_status = response_data.status_code if response_data else 200
+            is_reachable = (200 <= final_status < 400)
+            ssl_valid = final_url.startswith("https://") and not ssl_error_detected
+
+            return self._analyze_html(
+                raw_html=html_text,
+                url=clean_url,
+                final_url=final_url,
+                status_code=final_status,
+                is_reachable=is_reachable,
+                ssl_valid=ssl_valid,
+                redirect_chain=redirect_chain,
+                response_time_ms=response_time_ms,
+                business_name=business_name,
+                category=category,
+            )
+
+        except SSRFBlockedError as exc:
+            return self._build_blocked_result(clean_url, str(exc))
+        except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.TimeoutException):
+            return self._build_unreachable_result(clean_url, "Connection Timeout", "Site failed to respond within timeout window.")
         except httpx.ConnectError as exc:
-            return self._build_unreachable_result(clean_url, "Connection Error", f"DNS or connection failed: {str(exc)[:80]}")
+            return self._build_unreachable_result(clean_url, "Connection Error", f"DNS or TCP connection failed: {str(exc)[:80]}")
         except httpx.HTTPError as exc:
-            return self._build_unreachable_result(clean_url, "HTTP Protocol Error", str(exc)[:80])
+            return self._build_unreachable_result(clean_url, "HTTP Error", str(exc)[:80])
         except Exception as exc:
+            logger.exception(f"Unexpected audit exception for {clean_url}: {exc}")
             return self._build_unreachable_result(clean_url, "Audit Error", f"Unexpected error: {str(exc)[:80]}")
+
+    def _build_blocked_result(self, url: str, reason: str) -> WebsiteAuditResult:
+        """Returns structured audit result when an audit is blocked by SSRF policy."""
+        return WebsiteAuditResult(
+            has_website_url=True,
+            url=url,
+            final_url=url,
+            status_code=None,
+            is_reachable=False,
+            redirect_count=0,
+            redirect_chain=[url],
+            response_time_ms=None,
+            ssl_valid=False,
+            has_title=False,
+            has_viewport_meta=False,
+            has_description_meta=False,
+            has_menu=False,
+            has_contact_phone=False,
+            has_contact_email=False,
+            has_address_text=False,
+            has_clear_cta=False,
+            has_social_links=False,
+            detected_socials=[],
+            mobile_friendly_indicator=False,
+            mobile_issues=["Audit restricted by safety policy"],
+            findings=[
+                AuditFinding(
+                    check="Security Policy",
+                    status="verified",
+                    passed=False,
+                    summary="Audit target blocked by security policy: Destination violates networking policy.",
+                    evidence=reason,
+                ),
+                AuditFinding(
+                    check="Reachability",
+                    status="inferred",
+                    passed=False,
+                    summary="External audit prevented because target points to a private, loopback, or metadata destination.",
+                    evidence=reason,
+                ),
+            ],
+        )
+
+    def _build_ssl_failure_result(self, url: str, detail: str) -> WebsiteAuditResult:
+        """Returns structured audit result when TLS certificate validation fails."""
+        return WebsiteAuditResult(
+            has_website_url=True,
+            url=url,
+            final_url=url,
+            status_code=None,
+            is_reachable=False,
+            redirect_count=0,
+            redirect_chain=[url],
+            response_time_ms=None,
+            ssl_valid=False,
+            has_title=False,
+            has_viewport_meta=False,
+            has_description_meta=False,
+            has_menu=False,
+            has_contact_phone=False,
+            has_contact_email=False,
+            has_address_text=False,
+            has_clear_cta=False,
+            has_social_links=False,
+            detected_socials=[],
+            mobile_friendly_indicator=False,
+            mobile_issues=["Invalid SSL Certificate"],
+            findings=[
+                AuditFinding(
+                    check="SSL Security",
+                    status="verified",
+                    passed=False,
+                    summary="SSL certificate verification failed (self-signed, expired, or untrusted).",
+                    evidence=detail[:100],
+                ),
+                AuditFinding(
+                    check="Browser Security Warning",
+                    status="inferred",
+                    passed=False,
+                    summary="Prospective customers receive security warnings when visiting this domain.",
+                    evidence="Untrusted SSL Certificate",
+                ),
+            ],
+        )
 
     def _build_unreachable_result(self, url: str, error_type: str, detail: str) -> WebsiteAuditResult:
         return WebsiteAuditResult(
@@ -230,7 +679,7 @@ class WebsiteAuditor:
                 check="SSL Security",
                 status="verified",
                 passed=True,
-                summary="Website secures traffic with HTTPS.",
+                summary="Website secures traffic with valid HTTPS.",
                 evidence=final_url,
             ))
         else:
@@ -243,7 +692,7 @@ class WebsiteAuditor:
             ))
 
         # Social redirect check (e.g. website is just a Facebook or Instagram page)
-        parsed_final = urlparse(final_url).netloc.lower()
+        parsed_final = urllib.parse.urlsplit(final_url).netloc.lower()
         if any(social in parsed_final for social in ["facebook.com", "instagram.com", "linktr.ee", "wa.me"]):
             findings.append(AuditFinding(
                 check="Social Redirect",

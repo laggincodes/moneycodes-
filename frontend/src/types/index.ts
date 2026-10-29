@@ -127,3 +127,17 @@ export interface PaginatedLeads {
   page_size: number;
   total_pages: number;
 }
+
+export interface User {
+  id: string;
+  email: string;
+  full_name?: string;
+  created_at?: string;
+}
+
+export interface AuthResponse {
+  message: string;
+  user: User;
+  csrf_token: string;
+  session_token: string;
+}

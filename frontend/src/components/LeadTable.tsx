@@ -144,8 +144,8 @@ export const LeadTable: React.FC<LeadTableProps> = ({
       </div>
 
       {/* Table Data */}
-      <div className="overflow-x-auto">
-        <table className="w-full text-left text-xs">
+      <div className="overflow-x-auto -webkit-overflow-scrolling-touch">
+        <table className="w-full min-w-[640px] text-left text-xs">
           <thead className="bg-slate-950/60 border-b border-slate-800 text-slate-400 uppercase tracking-wider font-semibold">
             <tr>
               <th
@@ -317,17 +317,19 @@ export const LeadTable: React.FC<LeadTableProps> = ({
           <button
             onClick={() => onPageChange(page - 1)}
             disabled={page <= 1}
-            className="p-1.5 rounded-lg border border-slate-800 hover:bg-slate-800 disabled:opacity-30 disabled:cursor-not-allowed transition cursor-pointer"
+            aria-label="Previous Page"
+            className="p-2 min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg border border-slate-800 hover:bg-slate-800 disabled:opacity-30 disabled:cursor-not-allowed transition cursor-pointer"
           >
             <ChevronLeft className="w-4 h-4" />
           </button>
-          <span>
+          <span className="px-1">
             Page {page} of {totalPages}
           </span>
           <button
             onClick={() => onPageChange(page + 1)}
             disabled={page >= totalPages}
-            className="p-1.5 rounded-lg border border-slate-800 hover:bg-slate-800 disabled:opacity-30 disabled:cursor-not-allowed transition cursor-pointer"
+            aria-label="Next Page"
+            className="p-2 min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg border border-slate-800 hover:bg-slate-800 disabled:opacity-30 disabled:cursor-not-allowed transition cursor-pointer"
           >
             <ChevronRight className="w-4 h-4" />
           </button>

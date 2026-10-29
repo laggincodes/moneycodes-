@@ -1,19 +1,114 @@
-import type { JobResponse, Lead, PaginatedLeads, PipelineStatus } from '../types';
+import type { JobResponse, Lead, PaginatedLeads, PipelineStatus, User, AuthResponse } from '../types';
 
 const BASE_URL = '/api';
 
+let currentCsrfToken: string | null = null;
+
+export class ApiError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+  }
+}
+
+async function extractError(res: Response, fallback: string): Promise<never> {
+  let detail = fallback;
+  try {
+    const data = await res.json();
+    if (data && data.detail) {
+      detail = typeof data.detail === 'string' ? data.detail : JSON.stringify(data.detail);
+    }
+  } catch {
+    detail = `${fallback} (HTTP ${res.status})`;
+  }
+  const err = new ApiError(detail, res.status);
+  throw err;
+}
+
+function getHeaders(hasBody: boolean = false): Record<string, string> {
+  const headers: Record<string, string> = {};
+  if (hasBody) {
+    headers['Content-Type'] = 'application/json';
+  }
+  if (currentCsrfToken) {
+    headers['X-CSRF-Token'] = currentCsrfToken;
+  }
+  return headers;
+}
+
 export const api = {
+  // Authentication
+  async register(params: {
+    email: string;
+    password: string;
+    full_name?: string;
+  }): Promise<AuthResponse> {
+    const res = await fetch(`${BASE_URL}/auth/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify(params),
+    });
+    if (!res.ok) await extractError(res, 'Registration failed');
+    const data: AuthResponse = await res.json();
+    currentCsrfToken = data.csrf_token;
+    return data;
+  },
+
+  async login(params: { email: string; password: string }): Promise<AuthResponse> {
+    const res = await fetch(`${BASE_URL}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify(params),
+    });
+    if (!res.ok) await extractError(res, 'Invalid email or password');
+    const data: AuthResponse = await res.json();
+    currentCsrfToken = data.csrf_token;
+    return data;
+  },
+
+  async logout(): Promise<void> {
+    await fetch(`${BASE_URL}/auth/logout`, {
+      method: 'POST',
+      credentials: 'same-origin',
+    });
+    currentCsrfToken = null;
+  },
+
+  async getMe(): Promise<User | null> {
+    try {
+      const res = await fetch(`${BASE_URL}/auth/me`, {
+        credentials: 'same-origin',
+      });
+      if (!res.ok) {
+        currentCsrfToken = null;
+        return null;
+      }
+      const data = await res.json();
+      currentCsrfToken = data.csrf_token;
+      return data.user;
+    } catch {
+      currentCsrfToken = null;
+      return null;
+    }
+  },
+
   // Health
-  async getHealth(): Promise<{ status: string; service: string; llm_configured: boolean }> {
+  async getHealth(): Promise<{ status: string; service: string }> {
     const res = await fetch(`${BASE_URL}/health`);
-    if (!res.ok) throw new Error('Backend unreachable');
+    if (!res.ok) await extractError(res, 'Backend unreachable');
     return res.json();
   },
 
   // Discovery / Categories
   async getCategories(): Promise<Array<{ id: string; label: string }>> {
-    const res = await fetch(`${BASE_URL}/discovery/categories`);
-    if (!res.ok) throw new Error('Failed to load categories');
+    const res = await fetch(`${BASE_URL}/discovery/categories`, {
+      credentials: 'same-origin',
+    });
+    if (!res.ok) await extractError(res, 'Failed to load categories');
     return res.json();
   },
 
@@ -28,43 +123,57 @@ export const api = {
   }): Promise<JobResponse> {
     const res = await fetch(`${BASE_URL}/jobs`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: getHeaders(true),
+      credentials: 'same-origin',
       body: JSON.stringify(params),
     });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({ detail: 'Failed to start job' }));
-      throw new Error(err.detail || 'Failed to start job');
-    }
+    if (!res.ok) await extractError(res, 'Failed to start job');
     return res.json();
   },
 
   async getActiveJob(): Promise<JobResponse | null> {
-    const res = await fetch(`${BASE_URL}/jobs/active`);
+    const res = await fetch(`${BASE_URL}/jobs/active`, {
+      credentials: 'same-origin',
+    });
     if (!res.ok) return null;
     return res.json();
   },
 
   async getJob(jobId: string): Promise<JobResponse> {
-    const res = await fetch(`${BASE_URL}/jobs/${jobId}`);
-    if (!res.ok) throw new Error('Job not found');
+    const res = await fetch(`${BASE_URL}/jobs/${jobId}`, {
+      credentials: 'same-origin',
+    });
+    if (!res.ok) await extractError(res, 'Job not found');
     return res.json();
   },
 
   async pauseJob(jobId: string): Promise<{ status: string }> {
-    const res = await fetch(`${BASE_URL}/jobs/${jobId}/pause`, { method: 'POST' });
-    if (!res.ok) throw new Error('Failed to pause job');
+    const res = await fetch(`${BASE_URL}/jobs/${jobId}/pause`, {
+      method: 'POST',
+      headers: getHeaders(false),
+      credentials: 'same-origin',
+    });
+    if (!res.ok) await extractError(res, 'Failed to pause job');
     return res.json();
   },
 
   async resumeJob(jobId: string): Promise<{ status: string }> {
-    const res = await fetch(`${BASE_URL}/jobs/${jobId}/resume`, { method: 'POST' });
-    if (!res.ok) throw new Error('Failed to resume job');
+    const res = await fetch(`${BASE_URL}/jobs/${jobId}/resume`, {
+      method: 'POST',
+      headers: getHeaders(false),
+      credentials: 'same-origin',
+    });
+    if (!res.ok) await extractError(res, 'Failed to resume job');
     return res.json();
   },
 
   async cancelJob(jobId: string): Promise<{ status: string }> {
-    const res = await fetch(`${BASE_URL}/jobs/${jobId}/cancel`, { method: 'POST' });
-    if (!res.ok) throw new Error('Failed to cancel job');
+    const res = await fetch(`${BASE_URL}/jobs/${jobId}/cancel`, {
+      method: 'POST',
+      headers: getHeaders(false),
+      credentials: 'same-origin',
+    });
+    if (!res.ok) await extractError(res, 'Failed to cancel job');
     return res.json();
   },
 
@@ -93,35 +202,57 @@ export const api = {
     if (params.page) query.set('page', params.page.toString());
     if (params.page_size) query.set('page_size', params.page_size.toString());
 
-    const res = await fetch(`${BASE_URL}/leads?${query.toString()}`);
-    if (!res.ok) throw new Error('Failed to fetch leads');
+    const res = await fetch(`${BASE_URL}/leads?${query.toString()}`, {
+      credentials: 'same-origin',
+    });
+    if (!res.ok) await extractError(res, 'Failed to fetch leads');
     return res.json();
   },
 
   async getLead(leadId: string): Promise<Lead> {
-    const res = await fetch(`${BASE_URL}/leads/${leadId}`);
-    if (!res.ok) throw new Error('Lead not found');
+    const res = await fetch(`${BASE_URL}/leads/${leadId}`, {
+      credentials: 'same-origin',
+    });
+    if (!res.ok) await extractError(res, 'Lead not found');
     return res.json();
   },
 
-  async updateLeadPipeline(leadId: string, pipeline_status: PipelineStatus, notes?: string): Promise<Lead> {
+  async updateLeadPipeline(
+    leadId: string,
+    pipeline_status: PipelineStatus,
+    notes?: string,
+    idempotencyKey?: string,
+  ): Promise<Lead> {
+    const headers = getHeaders(true);
+    if (idempotencyKey) {
+      headers['Idempotency-Key'] = idempotencyKey;
+    }
     const res = await fetch(`${BASE_URL}/leads/${leadId}/pipeline`, {
       method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
+      credentials: 'same-origin',
       body: JSON.stringify({ pipeline_status, notes }),
     });
-    if (!res.ok) throw new Error('Failed to update pipeline stage');
+    if (!res.ok) await extractError(res, 'Failed to update pipeline stage');
     return res.json();
   },
 
   async deleteLead(leadId: string): Promise<void> {
-    const res = await fetch(`${BASE_URL}/leads/${leadId}`, { method: 'DELETE' });
-    if (!res.ok) throw new Error('Failed to delete lead');
+    const res = await fetch(`${BASE_URL}/leads/${leadId}`, {
+      method: 'DELETE',
+      headers: getHeaders(false),
+      credentials: 'same-origin',
+    });
+    if (!res.ok) await extractError(res, 'Failed to delete lead');
   },
 
   async clearAllLeads(): Promise<void> {
-    const res = await fetch(`${BASE_URL}/leads?all_leads=true`, { method: 'DELETE' });
-    if (!res.ok) throw new Error('Failed to clear leads');
+    const res = await fetch(`${BASE_URL}/leads?all_leads=true`, {
+      method: 'DELETE',
+      headers: getHeaders(false),
+      credentials: 'same-origin',
+    });
+    if (!res.ok) await extractError(res, 'Failed to clear leads');
   },
 
   // Export CSV

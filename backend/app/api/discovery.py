@@ -2,16 +2,20 @@
 Discovery helper endpoints: Geocoding and categories list.
 """
 from typing import List, Dict, Any
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
 from app.discovery.geocoding import NominatimGeocoder, GeocodingError
 from app.discovery.overpass import CATEGORY_LABELS
+from app.auth.dependencies import get_current_user
 
 router = APIRouter(prefix="/api/discovery", tags=["Discovery Helpers"])
 geocoder = NominatimGeocoder()
 
 
 @router.get("/geocode")
-async def geocode_location(q: str = Query(..., min_length=2)):
+async def geocode_location(
+    q: str = Query(..., min_length=2),
+    user: dict = Depends(get_current_user),
+):
     try:
         result = await geocoder.geocode(q)
         return {
